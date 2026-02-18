@@ -1,0 +1,19 @@
+Snowflake native app with artifact support: FInd me a workable solution for the below and the issues mentioned
+
+Data Integration Requirement: DII to UID2 Conversion
+
+Following our previous discussion, we are implementing a data-only integration
+that requires converting DII (Directly Identifiable Information) to UID2 tokens
+using The Trade Desk's Python SDK.(https://unifiedid.com/docs/sdks/sdk-ref-python)
+
+Technical Challenge:
+The required uid2_client Python library is not currently available in Snowflake's
+Anaconda repository. We explored using ARTIFACT_REPOSITORY which functioned correctly
+in standard environments, but this feature is not supported within Snowflake Native Apps.
+
+We also attempted to bundle the library as a ZIP file, however, this approach
+encountered issues due to the bitarray C extension dependency that cannot be
+easily packaged.
+
+Request: Please advise on the recommended approach to include this external Python
+library within a Snowflake Native App deployment

@@ -1,0 +1,21 @@
+manifest_version: 1
+
+version:
+  name: V1
+  label: "1.0.0"
+  comment: "Initial release - DII to UID2 Converter Native App"
+
+artifacts:
+  readme: readme.md
+  setup_script: scripts/setup.sql
+  default_streamlit: APP_SCHEMA.uid2_converter_app
+
+configuration:
+  log_level: INFO
+  trace_level: OFF
+
+privileges:
+  - CREATE WAREHOUSE:
+      description: "Required to create x86 warehouse for PyPI package execution"
+  - EXECUTE TASK:
+      description: "Required for scheduled batch processing (optional)"

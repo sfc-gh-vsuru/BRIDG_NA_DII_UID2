@@ -1,0 +1,66 @@
+Based on Snowflake documentation, here's a workable solution for including the uid2_client library with its C extension dependencies in your Snowflake Native App:
+
+Recommended Approach: Pre-compiled Wheel Files with Stage Imports
+Since ARTIFACT_REPOSITORY is not supported in Native Apps1, you should bundle the library with native code dependencies and import via stage.
+
+Solution Steps:
+1. Pre-compile the Package for x86 Architecture
+
+Build wheel files for x86 architecture (matching Snowflake's compute environment):
+
+BASH
+
+# Install dependencies and build wheels for x86
+pip wheel uid2_client --wheel-dir=./wheels --platform manylinux2014_x86_64 --only-binary=:all:
+# Or compile locally on x86 machine
+pip download uid2_client -d ./wheels --platform manylinux2014_x86_64
+2. Bundle as Artifacts in Your Native App
+
+Include the wheel files in your Native App project structure:
+
+/app_files/
+  /python_packages/
+    uid2_client-<version>-py3-none-any.whl
+    bitarray-<version>-cp311-cp311-manylinux_x86_64.whl
+  manifest.yml
+  setup.sql
+3. Create UDF/Stored Procedure in Versioned Schema
+
+In your Native App setup script, create functions with x86 constraint:2
+
+SQL
+
+CREATE OR REPLACE PROCEDURE app_schema.convert_dii_to_uid2(dii STRING)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  RESOURCE_CONSTRAINT = (architecture='x86')
+  IMPORTS = ('/python_packages/uid2_client.whl',
+             '/python_packages/bitarray.whl')
+  PACKAGES = ('requests', 'other_pure_python_deps')
+  HANDLER = 'uid2_handler.convert'
+AS $$
+# Your conversion logic here
+$$;
+4. Key Requirements for Native Apps:3
+
+Imports only allowed in versioned schemas
+Must use relative paths to access version artifacts
+Files must be in the application package stage root directory
+Alternative: ZIP Bundle Approach
+If wheel compilation is challenging, bundle as ZIP with pre-compiled binaries:
+
+SQL
+
+CREATE FUNCTION convert_to_uid2()
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  RESOURCE_CONSTRAINT = (architecture='x86')
+  IMPORTS = ('@app_stage/python_libs.zip')
+  HANDLER = 'uid2_module.convert'
+Important Notes:
+Architecture Specification: Always specify RESOURCE_CONSTRAINT=(architecture='x86') for native code4
+Package Policies: Native Apps are exempt from package policies, giving you more flexibility5
+Versioned Schemas: All UDFs with imports must be in versioned schemas6
+This approach successfully works around the ARTIFACT_REPOSITORY limitation while properly handling C extension dependencies.
