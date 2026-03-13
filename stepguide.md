@@ -248,7 +248,7 @@ FROM (
         'email',
         'https://operator-integ.uidapi.com',
         'fake-api-key',
-        'ioG3wKxAokmp+rERx6A4kM/13qhyolUXIu14WN+c/sE='
+        'YOUR_CLIENT_SECRET_BASE64'
     ) AS value
 ) r;
 ```
