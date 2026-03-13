@@ -1,14 +1,21 @@
 -- ============================================================================
 -- UID2 Native App Setup Script
 -- Converts Direct Identifying Information (DII) to UID2 tokens
+-- 
+-- PATTERN: Deferred UDF creation for ARTIFACT_REPOSITORY
+-- The uid2-client PyPI UDF cannot be created at install time because the app
+-- role lacks SNOWFLAKE.PYPI_REPOSITORY_USER. Instead, a setup procedure is
+-- provided that the consumer calls AFTER granting the database role to the app.
+--
+-- Consumer post-install steps:
+--   1. GRANT DATABASE ROLE SNOWFLAKE.PYPI_REPOSITORY_USER TO APPLICATION <app_name>;
+--   2. CALL <app_name>.APP_SCHEMA.setup_uid2_sdk();
 -- ============================================================================
 
--- Create versioned schema for stateless objects (UDFs, Streamlit)
 CREATE OR ALTER VERSIONED SCHEMA APP_SCHEMA;
 
 -- ============================================================================
--- HASH FUNCTION (Pure Python - No external dependencies)
--- This function normalizes and hashes DII without needing UID2 API credentials
+-- HASH FUNCTION (Pure Python - works immediately, no special grants needed)
 -- ============================================================================
 CREATE OR REPLACE FUNCTION APP_SCHEMA.hash_dii_for_uid2(
     dii STRING,
@@ -62,10 +69,45 @@ def main(dii, dii_type):
 $$;
 
 -- ============================================================================
--- UID2 CONVERSION FUNCTION (Using Anaconda packages available in Snowflake)
--- This uses the UID2 API directly via HTTP requests
--- Requires x86 warehouse due to native code dependencies in pycryptodome
+-- DEFERRED SETUP PROCEDURE
+-- Consumer calls this AFTER granting SNOWFLAKE.PYPI_REPOSITORY_USER to the app.
+-- This creates the UDF that uses Trade Desk's uid2-client from PyPI.
+-- Uses JavaScript to avoid nested quoting issues with EXECUTE IMMEDIATE.
 -- ============================================================================
+CREATE OR REPLACE PROCEDURE APP_SCHEMA.setup_uid2_sdk()
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+EXECUTE AS OWNER
+AS
+$$
+var python_code = [
+    'from uid2_client import IdentityMapClient, IdentityMapInput',
+    '',
+    'def main(dii, dii_type, base_url, api_key, client_secret):',
+    '    try:',
+    '        client = IdentityMapClient(base_url, api_key, client_secret)',
+    '        if dii_type.lower() == "email":',
+    '            identity_input = IdentityMapInput.from_emails([dii])',
+    '        elif dii_type.lower() == "phone":',
+    '            identity_input = IdentityMapInput.from_phones([dii])',
+    '        else:',
+    '            return {"error": f"Invalid dii_type: {dii_type}", "status": "error"}',
+    '        response = client.generate_identity_map(identity_input)',
+    '        if response.mapped_identities:',
+    '            first_key = list(response.mapped_identities.keys())[0]',
+    '            mapped = response.mapped_identities[first_key]',
+    '            return {"raw_uid2": mapped.get_raw_uid(), "bucket_id": mapped.get_bucket_id(), "status": "success"}',
+    '        elif response.unmapped_identities:',
+    '            first_key = list(response.unmapped_identities.keys())[0]',
+    '            unmapped = response.unmapped_identities[first_key]',
+    '            return {"error": f"Identity not mapped: {unmapped.get_reason()}", "status": "unmapped"}',
+    '        else:',
+    '            return {"error": "No response from UID2 API", "status": "error"}',
+    '    except Exception as e:',
+    '        return {"error": str(e), "status": "error"}'
+].join('\n');
+
+var create_sql = `
 CREATE OR REPLACE FUNCTION APP_SCHEMA.convert_dii_to_uid2(
     dii STRING,
     dii_type STRING,
@@ -76,158 +118,53 @@ CREATE OR REPLACE FUNCTION APP_SCHEMA.convert_dii_to_uid2(
 RETURNS VARIANT
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
-PACKAGES = ('snowflake-snowpark-python', 'requests', 'pycryptodome')
+ARTIFACT_REPOSITORY = snowflake.snowpark.pypi_shared_repository
+PACKAGES = ('uid2-client')
+RESOURCE_CONSTRAINT = (architecture='x86')
+EXTERNAL_ACCESS_INTEGRATIONS = (uid2_api_access)
 HANDLER = 'main'
-AS $$
-import hashlib
-import base64
-import time
-import os
-import json
-import requests
-from Crypto.Cipher import AES
+AS '` + python_code.replace(/'/g, "''") + `'`;
 
-def normalize_email(email: str) -> str:
-    email = email.lower().strip()
-    if '@' not in email:
-        return email
-    local, domain = email.rsplit('@', 1)
-    if domain in ('gmail.com', 'googlemail.com'):
-        local = local.replace('.', '').split('+')[0]
-    return f"{local}@{domain}"
+try {
+    snowflake.execute({sqlText: create_sql});
+} catch (err) {
+    return "ERROR creating UDF: " + err.message;
+}
 
-def normalize_phone(phone: str) -> str:
-    digits = ''.join(c for c in phone if c.isdigit() or c == '+')
-    if not digits.startswith('+'):
-        digits = '+1' + digits
-    return digits
+try {
+    snowflake.execute({sqlText: "GRANT USAGE ON FUNCTION APP_SCHEMA.convert_dii_to_uid2(STRING, STRING, STRING, STRING, STRING) TO APPLICATION ROLE app_public"});
+} catch (err) {
+    return "UDF created but GRANT failed: " + err.message;
+}
 
-def encrypt_request(payload: dict, client_secret: str) -> tuple:
-    secret_bytes = base64.b64decode(client_secret)
-    nonce = os.urandom(8)
-    timestamp = int(time.time() * 1000)
-    
-    body = json.dumps(payload).encode('utf-8')
-    data = timestamp.to_bytes(8, 'big') + nonce + body
-    
-    cipher = AES.new(secret_bytes, AES.MODE_GCM, nonce=nonce)
-    ciphertext, tag = cipher.encrypt_and_digest(data)
-    
-    envelope = b'\\x01' + nonce + ciphertext + tag
-    return base64.b64encode(envelope).decode('utf-8'), timestamp
-
-def decrypt_response(encrypted: str, client_secret: str, nonce: bytes) -> dict:
-    secret_bytes = base64.b64decode(client_secret)
-    data = base64.b64decode(encrypted)
-    
-    response_nonce = data[:12]
-    ciphertext = data[12:-16]
-    tag = data[-16:]
-    
-    cipher = AES.new(secret_bytes, AES.MODE_GCM, nonce=response_nonce)
-    decrypted = cipher.decrypt_and_verify(ciphertext, tag)
-    
-    return json.loads(decrypted[16:].decode('utf-8'))
-
-def main(dii, dii_type, base_url, api_key, client_secret):
-    try:
-        if dii_type.lower() == 'email':
-            normalized = normalize_email(dii)
-            hash_input = hashlib.sha256(normalized.encode('utf-8')).digest()
-            hash_b64 = base64.b64encode(hash_input).decode('utf-8')
-            payload = {'email_hash': [hash_b64]}
-        elif dii_type.lower() == 'phone':
-            normalized = normalize_phone(dii)
-            hash_input = hashlib.sha256(normalized.encode('utf-8')).digest()
-            hash_b64 = base64.b64encode(hash_input).decode('utf-8')
-            payload = {'phone_hash': [hash_b64]}
-        else:
-            return {'error': f'Invalid dii_type: {dii_type}', 'status': 'error'}
-        
-        encrypted_payload, timestamp = encrypt_request(payload, client_secret)
-        
-        url = f"{base_url.rstrip('/')}/v2/identity/map"
-        headers = {
-            'Authorization': f'Bearer {api_key}',
-            'Content-Type': 'text/plain'
-        }
-        
-        response = requests.post(url, data=encrypted_payload, headers=headers, timeout=30)
-        
-        if response.status_code == 200:
-            return {
-                'raw_response': response.text[:200],
-                'normalized_dii': normalized,
-                'hash_b64': hash_b64,
-                'status': 'api_called',
-                'note': 'Full decryption requires uid2-client SDK. Use hash for matching.'
-            }
-        else:
-            return {
-                'error': f'API error: {response.status_code} - {response.text[:200]}',
-                'status': 'error'
-            }
-            
-    except Exception as e:
-        return {'error': str(e), 'status': 'error'}
+return "UID2 SDK setup complete. convert_dii_to_uid2() is now available using Trade Desk uid2-client from PyPI.";
 $$;
 
 -- ============================================================================
--- BATCH CONVERSION TABLE FUNCTION (UDTF)
--- Efficiently process multiple DIIs at once
+-- STATUS CHECK PROCEDURE
+-- Lets consumers verify whether the SDK has been set up
 -- ============================================================================
-CREATE OR REPLACE FUNCTION APP_SCHEMA.batch_hash_dii(dii STRING, dii_type STRING)
-RETURNS TABLE (
-    original_dii STRING,
-    normalized_dii STRING,
-    dii_type STRING,
-    sha256_hash_base64 STRING,
-    status STRING
-)
-LANGUAGE PYTHON
-RUNTIME_VERSION = '3.11'
-PACKAGES = ('snowflake-snowpark-python')
-HANDLER = 'BatchHashHandler'
-AS $$
-import hashlib
-import base64
-
-class BatchHashHandler:
-    def normalize_email(self, email: str) -> str:
-        email = email.lower().strip()
-        if '@' not in email:
-            return email
-        local, domain = email.rsplit('@', 1)
-        if domain in ('gmail.com', 'googlemail.com'):
-            local = local.replace('.', '').split('+')[0]
-        return f"{local}@{domain}"
+CREATE OR REPLACE PROCEDURE APP_SCHEMA.check_uid2_sdk_status()
+RETURNS STRING
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS
+BEGIN
+    LET func_exists BOOLEAN := FALSE;
+    SELECT COUNT(*) > 0 INTO :func_exists
+    FROM INFORMATION_SCHEMA.FUNCTIONS
+    WHERE FUNCTION_NAME = 'CONVERT_DII_TO_UID2'
+      AND FUNCTION_SCHEMA = 'APP_SCHEMA';
     
-    def normalize_phone(self, phone: str) -> str:
-        digits = ''.join(c for c in phone if c.isdigit() or c == '+')
-        if not digits.startswith('+'):
-            digits = '+1' + digits
-        return digits
-    
-    def process(self, dii, dii_type):
-        try:
-            if dii_type.lower() == 'email':
-                normalized = self.normalize_email(dii)
-            elif dii_type.lower() == 'phone':
-                normalized = self.normalize_phone(dii)
-            else:
-                yield (dii, '', dii_type, '', f'Invalid type: {dii_type}')
-                return
-            
-            hashed = hashlib.sha256(normalized.encode('utf-8')).digest()
-            hash_b64 = base64.b64encode(hashed).decode('utf-8')
-            yield (dii, normalized, dii_type, hash_b64, 'success')
-        except Exception as e:
-            yield (dii, '', dii_type, '', f'Error: {str(e)}')
-$$;
+    IF (func_exists) THEN
+        RETURN 'READY: convert_dii_to_uid2() is available. You can call it with an x86 warehouse.';
+    ELSE
+        RETURN 'NOT CONFIGURED: Run these steps:\n1. GRANT DATABASE ROLE SNOWFLAKE.PYPI_REPOSITORY_USER TO APPLICATION <app_name>;\n2. CALL APP_SCHEMA.setup_uid2_sdk();';
+    END IF;
+END;
 
 -- ============================================================================
 -- STREAMLIT APPLICATION
--- Interactive dashboard for DII to UID2 conversion
 -- ============================================================================
 CREATE OR REPLACE STREAMLIT APP_SCHEMA.uid2_converter_app
     FROM '/streamlit'
@@ -240,6 +177,6 @@ CREATE APPLICATION ROLE IF NOT EXISTS app_public;
 
 GRANT USAGE ON SCHEMA APP_SCHEMA TO APPLICATION ROLE app_public;
 GRANT USAGE ON FUNCTION APP_SCHEMA.hash_dii_for_uid2(STRING, STRING) TO APPLICATION ROLE app_public;
-GRANT USAGE ON FUNCTION APP_SCHEMA.convert_dii_to_uid2(STRING, STRING, STRING, STRING, STRING) TO APPLICATION ROLE app_public;
-GRANT USAGE ON FUNCTION APP_SCHEMA.batch_hash_dii(STRING, STRING) TO APPLICATION ROLE app_public;
+GRANT USAGE ON PROCEDURE APP_SCHEMA.setup_uid2_sdk() TO APPLICATION ROLE app_public;
+GRANT USAGE ON PROCEDURE APP_SCHEMA.check_uid2_sdk_status() TO APPLICATION ROLE app_public;
 GRANT USAGE ON STREAMLIT APP_SCHEMA.uid2_converter_app TO APPLICATION ROLE app_public;
